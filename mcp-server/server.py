@@ -189,236 +189,581 @@ def get_dataset_metadata() -> dict[str, Any]:
     return rows[0]
 
 
+def _group_by_platform(
+    rows: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Group rows that include a platform_id column, by that column."""
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["platform_id"], []).append(row)
+    return grouped
+
+
 @mcp.tool()
-def list_platforms(
+def search_catalog(
+    platform_id: str | None = None,
     search: str | None = None,
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    """
-    List AI coding platforms.
-
-    Optionally search by platform name, company, or category.
-    """
-
-    limit = max(1, min(limit, 100))
-
-    if search:
-        search_text = f"%{search.strip()}%"
-
-        return run_query(
-            """
-            SELECT
-                platform_id,
-                platform_name,
-                category,
-                ai_native_ide,
-                ide_integrated_copilot,
-                offering_company
-            FROM public_api.platforms
-            WHERE platform_name ILIKE %s
-               OR offering_company ILIKE %s
-               OR category ILIKE %s
-            ORDER BY platform_name
-            LIMIT %s;
-            """,
-            (
-                search_text,
-                search_text,
-                search_text,
-                limit,
-            ),
-            maximum_rows=limit,
-        )
-
-    return run_query(
-        """
-        SELECT
-            platform_id,
-            platform_name,
-            category,
-            ai_native_ide,
-            ide_integrated_copilot,
-            offering_company
-        FROM public_api.platforms
-        ORDER BY platform_name
-        LIMIT %s;
-        """,
-        (limit,),
-        maximum_rows=limit,
-    )
-
-
-@mcp.tool()
-def find_plans(
     maximum_monthly_price: float | None = None,
     license_type: str | None = None,
-    platform_name: str | None = None,
+    model_family: str | None = None,
+    feature: str | None = None,
+    include: list[str] | None = None,
     limit: int = 20,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     """
-    Find subscription plans using optional price, licence,
-    and platform filters.
+    Search the AI coding platform catalog. Replaces the old
+    list_platforms / find_plans / get_platform_details tools with one
+    flexible entry point.
 
-    The comparable monthly price uses, in order:
-    per-user monthly price, monthly list price, or annual
-    monthly equivalent.
+    Two modes:
+
+    - Single platform (set platform_id): returns full detail for that one
+      platform - its plans, supported model families, and feature
+      support - ignoring every other filter below.
+
+    - List/search (leave platform_id unset): returns
+      {"total_matches": N, "returned": M, "results": [...]} using any
+      combination of these filters:
+        - search: free text against platform name, company, or category
+        - maximum_monthly_price: keep only platforms with at least one
+          plan at or under this price (per-user monthly, monthly list,
+          or annual monthly equivalent, in that priority order)
+        - license_type: substring match against plan license type
+        - model_family: keep only platforms that support a model family
+          whose name matches this substring
+        - feature: keep only platforms that support (supported = true) a
+          feature whose name matches this substring
+      total_matches is the full count before limit is applied, so a
+      truncated result list is never mistaken for the complete answer.
+      When maximum_monthly_price and/or license_type are set, each
+      platform also carries a "matching_plans" list - the specific
+      tier(s) that satisfied those filters - so a price/license match
+      can be traced to the exact plan(s) responsible, not just the
+      platform as a whole.
+      By default list results are otherwise lean (platform summary rows
+      only). Pass include=["plans"], ["models"], ["features"], or any
+      combination, to attach those full sections to each platform too.
+
+    limit applies to list mode only (1-100, default 20).
+
+    Note: model and feature availability is currently recorded mainly at
+    the platform level. A match does not automatically prove every
+    subscription tier includes that model or feature.
     """
+
+    if platform_id:
+        platform_rows = run_query(
+            """
+            SELECT *
+            FROM public_api.platforms
+            WHERE platform_id = %s;
+            """,
+            (platform_id,),
+            maximum_rows=1,
+        )
+
+        if not platform_rows:
+            return {
+                "error": "Platform was not found.",
+                "platform_id": platform_id,
+            }
+
+        plans = run_query(
+            """
+            SELECT
+                tier_id,
+                tier_name,
+                license_type,
+                currency,
+                billing_frequency,
+                monthly_list_price,
+                annual_total_price,
+                annual_monthly_equivalent,
+                per_user_monthly,
+                minimum_account_charge,
+                effective_date,
+                best_suited_for
+            FROM public_api.plans
+            WHERE platform_id = %s
+            ORDER BY tier_name;
+            """,
+            (platform_id,),
+        )
+
+        models = run_query(
+            """
+            SELECT
+                model_family_id,
+                family_name,
+                provider_name,
+                status_id,
+                status_label,
+                counts_as_current
+            FROM public_api.platform_models
+            WHERE platform_id = %s
+            ORDER BY family_name;
+            """,
+            (platform_id,),
+        )
+
+        features = run_query(
+            """
+            SELECT
+                feature_id,
+                feature_name,
+                feature_category,
+                supported,
+                support_value,
+                support_note
+            FROM public_api.platform_features
+            WHERE platform_id = %s
+            ORDER BY feature_category, feature_name;
+            """,
+            (platform_id,),
+        )
+
+        return {
+            "platform": platform_rows[0],
+            "plans": plans,
+            "models": models,
+            "features": features,
+            "important_limitation": (
+                "Model and feature availability is currently recorded "
+                "mainly at platform level. It does not automatically "
+                "prove that every subscription tier includes the item."
+            ),
+        }
+
+    # --- list/search mode ---
 
     limit = max(1, min(limit, 100))
+    include = include or []
+    unknown_sections = set(include) - {"plans", "models", "features"}
+    if unknown_sections:
+        raise ValueError(
+            "include may only contain 'plans', 'models', 'features'. "
+            f"Got unknown value(s): {sorted(unknown_sections)}"
+        )
+
+    if maximum_monthly_price is not None and maximum_monthly_price < 0:
+        raise ValueError("maximum_monthly_price cannot be negative.")
 
     conditions = ["1 = 1"]
     parameters: list[Any] = []
 
-    if maximum_monthly_price is not None:
-        if maximum_monthly_price < 0:
-            raise ValueError(
-                "maximum_monthly_price cannot be negative."
-            )
-
+    if search:
+        search_text = f"%{search.strip()}%"
         conditions.append(
             """
+            (
+                plat.platform_name ILIKE %s
+                OR plat.offering_company ILIKE %s
+                OR plat.category ILIKE %s
+            )
+            """
+        )
+        parameters.extend([search_text, search_text, search_text])
+
+    # Kept separate from `conditions` (which filters platforms) so the
+    # exact same predicate can be reused afterwards to fetch the specific
+    # plans that matched, rather than just proving a match existed.
+    matching_plan_conditions = ["pl.platform_id = plat.platform_id"]
+    matching_plan_parameters: list[Any] = []
+
+    if maximum_monthly_price is not None:
+        matching_plan_conditions.append(
+            """
             COALESCE(
-                per_user_monthly,
-                monthly_list_price,
-                annual_monthly_equivalent
+                pl.per_user_monthly,
+                pl.monthly_list_price,
+                pl.annual_monthly_equivalent
             ) <= %s
             """
         )
-        parameters.append(maximum_monthly_price)
+        matching_plan_parameters.append(maximum_monthly_price)
 
     if license_type:
-        conditions.append("license_type ILIKE %s")
-        parameters.append(f"%{license_type.strip()}%")
+        matching_plan_conditions.append("pl.license_type ILIKE %s")
+        matching_plan_parameters.append(f"%{license_type.strip()}%")
 
-    if platform_name:
-        conditions.append("platform_name ILIKE %s")
-        parameters.append(f"%{platform_name.strip()}%")
+    has_plan_level_filter = (
+        maximum_monthly_price is not None or license_type is not None
+    )
 
-    parameters.append(limit)
+    if has_plan_level_filter:
+        conditions.append(
+            f"""
+            EXISTS (
+                SELECT 1 FROM public_api.plans pl
+                WHERE {" AND ".join(matching_plan_conditions)}
+            )
+            """
+        )
+        parameters.extend(matching_plan_parameters)
 
-    query = f"""
-        SELECT
-            platform_id,
-            platform_name,
-            tier_id,
-            tier_name,
-            license_type,
-            currency,
-            billing_frequency,
-            monthly_list_price,
-            annual_total_price,
-            annual_monthly_equivalent,
-            per_user_monthly,
-            minimum_account_charge,
-            COALESCE(
-                per_user_monthly,
-                monthly_list_price,
-                annual_monthly_equivalent
-            ) AS comparable_monthly_price,
-            pricing_formula_type,
-            effective_date,
-            best_suited_for
-        FROM public_api.plans
-        WHERE {" AND ".join(conditions)}
-        ORDER BY
-            comparable_monthly_price NULLS LAST,
-            platform_name,
-            tier_name
-        LIMIT %s;
-    """
+    if model_family:
+        conditions.append(
+            """
+            EXISTS (
+                SELECT 1 FROM public_api.platform_models pm
+                WHERE pm.platform_id = plat.platform_id
+                  AND pm.family_name ILIKE %s
+            )
+            """
+        )
+        parameters.append(f"%{model_family.strip()}%")
 
-    return run_query(
-        query,
+    if feature:
+        conditions.append(
+            """
+            EXISTS (
+                SELECT 1 FROM public_api.platform_features pf
+                WHERE pf.platform_id = plat.platform_id
+                  AND pf.feature_name ILIKE %s
+                  AND pf.supported = true
+            )
+            """
+        )
+        parameters.append(f"%{feature.strip()}%")
+
+    where_clause = " AND ".join(conditions)
+
+    total_matches_rows = run_query(
+        f"""
+        SELECT COUNT(*) AS total
+        FROM public_api.platforms plat
+        WHERE {where_clause};
+        """,
         tuple(parameters),
+        maximum_rows=1,
+    )
+    total_matches = total_matches_rows[0]["total"] if total_matches_rows else 0
+
+    platforms = run_query(
+        f"""
+        SELECT
+            plat.platform_id,
+            plat.platform_name,
+            plat.category,
+            plat.ai_native_ide,
+            plat.ide_integrated_copilot,
+            plat.offering_company
+        FROM public_api.platforms plat
+        WHERE {where_clause}
+        ORDER BY plat.platform_name
+        LIMIT %s;
+        """,
+        tuple(parameters) + (limit,),
         maximum_rows=limit,
     )
 
+    if not platforms:
+        return {"total_matches": total_matches, "returned": 0, "results": []}
+
+    matched_ids = [row["platform_id"] for row in platforms]
+
+    if has_plan_level_filter:
+        matching_plan_rows = run_query(
+            f"""
+            SELECT
+                pl.platform_id,
+                pl.tier_id,
+                pl.tier_name,
+                pl.license_type,
+                pl.currency,
+                pl.billing_frequency,
+                pl.monthly_list_price,
+                pl.annual_total_price,
+                pl.annual_monthly_equivalent,
+                pl.per_user_monthly,
+                pl.minimum_account_charge,
+                pl.effective_date,
+                pl.best_suited_for
+            FROM public_api.plans pl
+            WHERE pl.platform_id = ANY(%s)
+              AND {" AND ".join(matching_plan_conditions[1:])}
+            ORDER BY pl.platform_id, pl.tier_name;
+            """,
+            (matched_ids, *matching_plan_parameters),
+            maximum_rows=len(matched_ids) * 50,
+        )
+        matching_plans_by_platform = _group_by_platform(matching_plan_rows)
+        for row in platforms:
+            row["matching_plans"] = matching_plans_by_platform.get(
+                row["platform_id"], []
+            )
+
+    if "plans" in include:
+        plan_rows = run_query(
+            """
+            SELECT
+                platform_id,
+                tier_id,
+                tier_name,
+                license_type,
+                currency,
+                billing_frequency,
+                monthly_list_price,
+                annual_total_price,
+                annual_monthly_equivalent,
+                per_user_monthly,
+                minimum_account_charge,
+                effective_date,
+                best_suited_for
+            FROM public_api.plans
+            WHERE platform_id = ANY(%s)
+            ORDER BY platform_id, tier_name;
+            """,
+            (matched_ids,),
+            maximum_rows=len(matched_ids) * 50,
+        )
+        plans_by_platform = _group_by_platform(plan_rows)
+        for row in platforms:
+            row["plans"] = plans_by_platform.get(row["platform_id"], [])
+
+    if "models" in include:
+        model_rows = run_query(
+            """
+            SELECT
+                platform_id,
+                model_family_id,
+                family_name,
+                provider_name,
+                status_id,
+                status_label,
+                counts_as_current
+            FROM public_api.platform_models
+            WHERE platform_id = ANY(%s)
+            ORDER BY platform_id, family_name;
+            """,
+            (matched_ids,),
+            maximum_rows=len(matched_ids) * 50,
+        )
+        models_by_platform = _group_by_platform(model_rows)
+        for row in platforms:
+            row["models"] = models_by_platform.get(
+                row["platform_id"], []
+            )
+
+    if "features" in include:
+        feature_rows = run_query(
+            """
+            SELECT
+                platform_id,
+                feature_id,
+                feature_name,
+                feature_category,
+                supported,
+                support_value,
+                support_note
+            FROM public_api.platform_features
+            WHERE platform_id = ANY(%s)
+            ORDER BY platform_id, feature_category, feature_name;
+            """,
+            (matched_ids,),
+            maximum_rows=len(matched_ids) * 50,
+        )
+        features_by_platform = _group_by_platform(feature_rows)
+        for row in platforms:
+            row["features"] = features_by_platform.get(
+                row["platform_id"], []
+            )
+
+    return {
+        "total_matches": total_matches,
+        "returned": len(platforms),
+        "results": platforms,
+    }
+
 
 @mcp.tool()
-def get_platform_details(
-    platform_id: str,
-) -> dict[str, Any]:
-    """Return one platform with its plans, models, and features."""
+def list_facet_values() -> dict[str, Any]:
+    """
+    List the distinct values that actually exist in the catalog for the
+    filterable fields: platform categories, plan license types,
+    currencies in use, feature names (grouped by category), and model
+    family names (grouped by provider).
+
+    Call this before guessing filter strings for search_catalog (e.g.
+    "Claude" vs "Claude Sonnet" vs "Anthropic Claude") - it grounds the
+    filter in real data instead of a substring guess that may silently
+    match nothing.
+    """
+
+    categories = run_query(
+        """
+        SELECT DISTINCT category
+        FROM public_api.platforms
+        WHERE category IS NOT NULL
+        ORDER BY category;
+        """,
+        maximum_rows=200,
+    )
+    license_types = run_query(
+        """
+        SELECT DISTINCT license_type
+        FROM public_api.plans
+        WHERE license_type IS NOT NULL
+        ORDER BY license_type;
+        """,
+        maximum_rows=200,
+    )
+    currencies = run_query(
+        """
+        SELECT DISTINCT currency
+        FROM public_api.plans
+        WHERE currency IS NOT NULL
+        ORDER BY currency;
+        """,
+        maximum_rows=50,
+    )
+    features = run_query(
+        """
+        SELECT DISTINCT feature_name, feature_category
+        FROM public_api.platform_features
+        ORDER BY feature_category, feature_name;
+        """,
+        maximum_rows=200,
+    )
+    model_families = run_query(
+        """
+        SELECT DISTINCT family_name, provider_name
+        FROM public_api.platform_models
+        ORDER BY provider_name, family_name;
+        """,
+        maximum_rows=300,
+    )
+
+    return {
+        "categories": [row["category"] for row in categories],
+        "license_types": [row["license_type"] for row in license_types],
+        "currencies_in_use": [row["currency"] for row in currencies],
+        "features": features,
+        "model_families": model_families,
+    }
+
+
+@mcp.tool()
+def compare_platforms(platform_ids: list[str]) -> dict[str, Any]:
+    """
+    Compare 2-5 platforms side by side: each platform's cheapest plan,
+    full plan list, supported model families, and feature support,
+    aligned together so differences are easy to spot without the caller
+    having to diff several separate get_platform_details-style calls.
+
+    platform_ids: the platform_id values to compare (from search_catalog
+    or list_facet_values results).
+    """
+
+    if not platform_ids:
+        raise ValueError("Provide at least one platform_id.")
+
+    if len(platform_ids) > 5:
+        raise ValueError(
+            "Compare at most 5 platforms at a time for a readable result."
+        )
 
     platform_rows = run_query(
         """
         SELECT *
         FROM public_api.platforms
-        WHERE platform_id = %s;
+        WHERE platform_id = ANY(%s)
+        ORDER BY platform_name;
         """,
-        (platform_id,),
-        maximum_rows=1,
+        (platform_ids,),
+        maximum_rows=len(platform_ids),
     )
 
-    if not platform_rows:
-        return {
-            "error": "Platform was not found.",
-            "platform_id": platform_id,
-        }
+    found_ids = {row["platform_id"] for row in platform_rows}
+    not_found = [pid for pid in platform_ids if pid not in found_ids]
 
     plans = run_query(
         """
-        SELECT
-            tier_id,
-            tier_name,
-            license_type,
-            currency,
-            billing_frequency,
-            monthly_list_price,
-            annual_total_price,
-            annual_monthly_equivalent,
-            per_user_monthly,
-            minimum_account_charge,
-            effective_date,
-            best_suited_for
+        SELECT *
         FROM public_api.plans
-        WHERE platform_id = %s
-        ORDER BY tier_name;
+        WHERE platform_id = ANY(%s)
+        ORDER BY platform_id, tier_name;
         """,
-        (platform_id,),
+        (platform_ids,),
+        maximum_rows=len(platform_ids) * 50,
     )
-
     models = run_query(
         """
-        SELECT
-            model_family_id,
-            family_name,
-            provider_name,
-            status_id,
-            status_label,
-            counts_as_current
+        SELECT *
         FROM public_api.platform_models
-        WHERE platform_id = %s
-        ORDER BY family_name;
+        WHERE platform_id = ANY(%s)
+        ORDER BY platform_id, family_name;
         """,
-        (platform_id,),
+        (platform_ids,),
+        maximum_rows=len(platform_ids) * 100,
     )
-
     features = run_query(
         """
-        SELECT
-            feature_id,
-            feature_name,
-            feature_category,
-            supported,
-            support_value,
-            support_note
+        SELECT *
         FROM public_api.platform_features
-        WHERE platform_id = %s
-        ORDER BY feature_category, feature_name;
+        WHERE platform_id = ANY(%s)
+        ORDER BY platform_id, feature_category, feature_name;
         """,
-        (platform_id,),
+        (platform_ids,),
+        maximum_rows=len(platform_ids) * 100,
     )
 
+    plans_by_platform = _group_by_platform(plans)
+    models_by_platform = _group_by_platform(models)
+    features_by_platform = _group_by_platform(features)
+
+    currencies_in_play = sorted(
+        {plan["currency"] for plan in plans if plan.get("currency")}
+    )
+
+    comparison = []
+    for row in platform_rows:
+        platform_id = row["platform_id"]
+        platform_plans = plans_by_platform.get(platform_id, [])
+
+        cheapest_plan = None
+        cheapest_price = None
+        for plan in platform_plans:
+            price = (
+                plan.get("per_user_monthly")
+                or plan.get("monthly_list_price")
+                or plan.get("annual_monthly_equivalent")
+            )
+            if price is not None and (
+                cheapest_price is None or price < cheapest_price
+            ):
+                cheapest_price = price
+                cheapest_plan = plan
+
+        comparison.append(
+            {
+                "platform": row,
+                "cheapest_plan": cheapest_plan,
+                "all_plans": platform_plans,
+                "models": models_by_platform.get(platform_id, []),
+                "features": features_by_platform.get(platform_id, []),
+            }
+        )
+
     return {
-        "platform": platform_rows[0],
-        "plans": plans,
-        "models": models,
-        "features": features,
+        "compared": comparison,
+        "not_found": not_found,
+        "currency_warning": (
+            None
+            if len(currencies_in_play) <= 1
+            else (
+                "These platforms price plans in different currencies "
+                f"({', '.join(currencies_in_play)}). Cheapest-plan and "
+                "price comparisons across platforms are not "
+                "apples-to-apples without a currency conversion."
+            )
+        ),
         "important_limitation": (
             "Model and feature availability is currently recorded "
-            "mainly at platform level. It does not automatically prove "
-            "that every subscription tier includes the item."
+            "mainly at the platform level. A model or feature shown "
+            "here does not guarantee that the platform's cheapest (or "
+            "any specific) plan tier includes it."
         ),
     }
 
